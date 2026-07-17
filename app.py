@@ -11,6 +11,8 @@ from token_manager import generate_token, verify_token
 import cloudinary.uploader
 import os
 
+print("TEST:", os.getenv("TEST_VAR"))
+print("CLOUDINARY:", os.getenv("CLOUDINARY_API_KEY"))
 print("CLOUDINARY KEY:", os.getenv("CLOUDINARY_API_KEY"))
 
 
