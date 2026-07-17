@@ -1,8 +1,5 @@
 from flask import Flask, render_template, request, send_file
 from werkzeug.utils import secure_filename
-from dotenv import load_dotenv
-
-load_dotenv()
 
 from encryption import encrypt_file, decrypt_file
 from cloudinary_config import cloudinary
@@ -11,13 +8,8 @@ from token_manager import generate_token, verify_token
 import cloudinary.uploader
 import os
 
-print("TEST:", os.getenv("TEST_VAR"))
-print("CLOUDINARY:", os.getenv("CLOUDINARY_API_KEY"))
-print("CLOUDINARY KEY:", os.getenv("CLOUDINARY_API_KEY"))
-
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY")
 
 
 # =========================
