@@ -11,6 +11,8 @@ from token_manager import generate_token, verify_token
 import cloudinary.uploader
 import os
 
+print("CLOUDINARY KEY:", os.getenv("CLOUDINARY_API_KEY"))
+
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY")
