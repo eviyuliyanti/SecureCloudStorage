@@ -8,12 +8,11 @@ from token_manager import generate_token, verify_token
 import cloudinary.uploader
 import os
 import requests
-import io  # Diperlukan untuk menjembatani pengiriman file dari RAM agar tidak eror
 
 app = Flask(__name__)
 
 # =========================
-# CONFIGURATION & SYSTEM FOLDERS
+# FOLDER SYSTEM
 # =========================
 UPLOAD_FOLDER = "uploads"
 ENCRYPTED_FOLDER = "encrypted"
@@ -25,14 +24,14 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCRYPTED_FOLDER, exist_ok=True)
 
 # =========================
-# 1. HOME ROUTE
+# HOME
 # =========================
 @app.route("/")
 def home():
     return render_template("index.html")
 
 # =========================
-# 2. UPLOAD + ENCRYPT ROUTE
+# UPLOAD + ENCRYPT
 # =========================
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -43,34 +42,38 @@ def upload():
 
     filename = secure_filename(file.filename)
 
-    # Simpan file asli sementara di server lokal untuk diproses
+    # Simpan file asli sementara di server lokal
     original_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(original_path)
 
-    # Tentukan jalur output untuk file terenkripsi (.enc)
+    # =====================
+    # AES ENCRYPTION
+    # =====================
     encrypted_filename = filename + ".enc"
     encrypted_path = os.path.join(ENCRYPTED_FOLDER, encrypted_filename)
 
     try:
-        # Mengenkripsi file menggunakan fungsi asli dari encryption.py
+        # Mengenkripsi file sebelum diunggah ke cloud
         encrypt_file(original_path, encrypted_path)
 
-        # Mengunggah berkas biner terenkripsi ke Cloudinary
+        # =====================
+        # CLOUDINARY UPLOAD
+        # =====================
         result = cloudinary.uploader.upload(
             encrypted_path,
             resource_type="raw"
         )
         cloud_url = result["secure_url"]
 
-        # HAPUS FILE SEMENTARA DI DISK LOKAL
-        # Langkah wajib agar sesuai dengan desain "Penyimpanan Aman di Cloud" 
-        # sehingga tidak meninggalkan jejak file mentah/terenkripsi di server Railway
+        # Bersihkan berkas setelah sukses dienkripsi & upload
         if os.path.exists(original_path):
             os.remove(original_path)
         if os.path.exists(encrypted_path):
             os.remove(encrypted_path)
 
-        # Menyimpan cloud_url dan filename asli ke dalam payload JWT
+        # =====================
+        # CREATE JWT TOKEN
+        # =====================
         token = generate_token(cloud_url, filename)
 
         return render_template(
@@ -79,17 +82,15 @@ def upload():
             cloud_url=cloud_url,
             filename=filename
         )
-
     except Exception as e:
-        # Jika terjadi kegagalan sistem, pastikan file temporary tetap dibersihkan
         if os.path.exists(original_path):
             os.remove(original_path)
         if os.path.exists(encrypted_path):
             os.remove(encrypted_path)
-        return f"Terjadi kesalahan saat upload/enkripsi: {str(e)}", 500
+        return f"Error saat upload: {str(e)}", 500
 
 # =========================
-# 3. SECURE DOWNLOAD VIA TOKEN ROUTE
+# SECURE DOWNLOAD
 # =========================
 @app.route("/secure-download")
 def secure_download():
@@ -105,19 +106,19 @@ def secure_download():
         return "Token tidak valid atau expired", 401
 
     filename = data["filename"]
-    cloud_url = data["cloud_url"]  # Mengambil URL Cloudinary dari payload token
+    cloud_url = data["cloud_url"]  
 
-    # Menentukan jalur unduhan file terenkripsi dan dekripsi sementara di lokal
-    temp_encrypted_file = os.path.join(ENCRYPTED_FOLDER, "download_" + filename + ".enc")
-    temp_decrypted_file = os.path.join(UPLOAD_FOLDER, "clean_" + filename)
+    # Menentukan jalur unduhan berkas terenkripsi dan hasil dekripsi
+    encrypted_file = os.path.join(ENCRYPTED_FOLDER, "dl_" + filename + ".enc")
+    decrypted_file = os.path.join(UPLOAD_FOLDER, "dec_" + filename)
 
     # -------------------------------------------------------------
-    # FASE 1: TARIK CIPHERTEXT DARI CLOUD VIA HTTP STREAM
+    # 1. AMBIL FILE DARI CLOUDINARY
     # -------------------------------------------------------------
     try:
         response = requests.get(cloud_url, stream=True)
         if response.status_code == 200:
-            with open(temp_encrypted_file, 'wb') as f:
+            with open(encrypted_file, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
         else:
@@ -126,43 +127,43 @@ def secure_download():
         return f"Error koneksi Cloudinary: {str(e)}", 500
 
     # -------------------------------------------------------------
-    # FASE 2: DEKRIPSI DAN AMANKAN DI RAM SEBELUM PENGIRIMAN
+    # 2. DEKRIPSI DAN PENGIRIMAN FILE AMAN
     # -------------------------------------------------------------
     try:
-        # Mendekripsi berkas biner menggunakan fungsi asli dari encryption.py
-        decrypt_file(temp_encrypted_file, temp_decrypted_file)
+        # Jalankan fungsi dekripsi asli bawaanmu
+        decrypt_file(encrypted_file, decrypted_file)
 
-        # Segera hapus file biner terenkripsi (.enc) karena proses dekripsi sudah selesai
-        if os.path.exists(temp_encrypted_file):
-            os.remove(temp_encrypted_file)
+        # Hapus segera file terenkripsi (.enc) biar gak menumpuk di server
+        if os.path.exists(encrypted_file):
+            os.remove(encrypted_file)
 
-        # TRIK ANTI-EROR: Membaca file asli yang bersih langsung ke memori internal (RAM)
-        # Dengan memindahkan biner ke RAM, file fisik di disk server bisa langsung kita hapus 
-        # tanpa memicu eror "File Not Found" pada fungsi send_file() milik Flask.
-        with open(temp_decrypted_file, 'rb') as f:
-            file_buffer = io.BytesIO(f.read())
+        # FUNGSI GENERATOR: Membaca file untuk dikirim, lalu menghapusnya setelah selesai
+        def generate_and_cleanup():
+            with open(decrypted_file, 'rb') as f:
+                yield from f
+            # Blok ini dieksekusi setelah browser selesai mendownload file sepenuhnya
+            try:
+                if os.path.exists(decrypted_file):
+                    os.remove(decrypted_file)
+            except Exception as e:
+                pass
 
-        # Hapus file mentah hasil dekripsi dari disk lokal server
-        if os.path.exists(temp_decrypted_file):
-            os.remove(temp_decrypted_file)
-
-        # Kembalikan pointer buffer ke posisi awal sebelum dikirim
-        file_buffer.seek(0)
-
-        # Mengirim berkas asli yang sudah bersih sebagai lampiran unduhan
-        return send_file(
-            file_buffer,
-            as_attachment=True,
-            download_name=filename
+        # Kirim stream data bersih menggunakan generator aman
+        return app.response_class(
+            generate_and_cleanup(),
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Type": "application/octet-stream"
+            }
         )
 
     except Exception as e:
-        # Bersihkan sisa file di server jika proses di tengah jalan mengalami crash
-        if os.path.exists(temp_encrypted_file):
-            os.remove(temp_encrypted_file)
-        if os.path.exists(temp_decrypted_file):
-            os.remove(temp_decrypted_file)
-        return f"Gagal memproses dekripsi berkas: {str(e)}", 500
+        # Bersihkan file sisa jika terjadi crash di tengah jalan
+        if os.path.exists(encrypted_file):
+            os.remove(encrypted_file)
+        if os.path.exists(decrypted_file):
+            os.remove(decrypted_file)
+        return f"Gagal mendekripsi berkas: {str(e)}", 500
 
 # =========================
 # RUN SERVER
