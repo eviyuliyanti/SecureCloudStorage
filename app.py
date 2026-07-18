@@ -8,13 +8,16 @@ from token_manager import generate_token, verify_token
 import cloudinary.uploader
 import os
 import requests
-import io  # Ditambahkan untuk menangani konversi biner langsung di memori (RAM)
+import io  # Diperlukan untuk menjembatani pengiriman file dari RAM agar tidak eror
 
 app = Flask(__name__)
 
-# Folder temporary tetap dibuat jika library enkripsi lama kamu membutuhkannya
+# =========================
+# CONFIGURATION & SYSTEM FOLDERS
+# =========================
 UPLOAD_FOLDER = "uploads"
 ENCRYPTED_FOLDER = "encrypted"
+
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["ENCRYPTED_FOLDER"] = ENCRYPTED_FOLDER
 
@@ -22,14 +25,14 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCRYPTED_FOLDER, exist_ok=True)
 
 # =========================
-# HOME
+# 1. HOME ROUTE
 # =========================
 @app.route("/")
 def home():
     return render_template("index.html")
 
 # =========================
-# UPLOAD + ENCRYPT
+# 2. UPLOAD + ENCRYPT ROUTE
 # =========================
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -40,108 +43,125 @@ def upload():
 
     filename = secure_filename(file.filename)
 
-    # 1. Simpan file asli sementara di server lokal untuk dienkripsi
+    # Simpan file asli sementara di server lokal untuk diproses
     original_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(original_path)
 
-    # 2. PROSES ENKRIPSI AES
+    # Tentukan jalur output untuk file terenkripsi (.enc)
     encrypted_filename = filename + ".enc"
     encrypted_path = os.path.join(ENCRYPTED_FOLDER, encrypted_filename)
-    encrypt_file(original_path, encrypted_path)
 
-    # 3. UNGGAH KE CLOUD (Cloudinary Object Storage)
-    result = cloudinary.uploader.upload(
-        encrypted_path,
-        resource_type="raw"
-    )
-    cloud_url = result["secure_url"]
+    try:
+        # Mengenkripsi file menggunakan fungsi asli dari encryption.py
+        encrypt_file(original_path, encrypted_path)
 
-    # 4. HAPUS FILE SEMENTARA (Sesuai konsep cloud storage aman, lokal server harus bersih)
-    if os.path.exists(original_path):
-        os.remove(original_path)
-    if os.path.exists(encrypted_path):
-        os.remove(encrypted_path)
+        # Mengunggah berkas biner terenkripsi ke Cloudinary
+        result = cloudinary.uploader.upload(
+            encrypted_path,
+            resource_type="raw"
+        )
+        cloud_url = result["secure_url"]
 
-    # 5. PEMBUATAN TOKEN AKSES (JWT)
-    token = generate_token(cloud_url, filename)
+        # HAPUS FILE SEMENTARA DI DISK LOKAL
+        # Langkah wajib agar sesuai dengan desain "Penyimpanan Aman di Cloud" 
+        # sehingga tidak meninggalkan jejak file mentah/terenkripsi di server Railway
+        if os.path.exists(original_path):
+            os.remove(original_path)
+        if os.path.exists(encrypted_path):
+            os.remove(encrypted_path)
 
-    return render_template(
-        "result.html",
-        token=token,
-        cloud_url=cloud_url,
-        filename=filename
-    )
+        # Menyimpan cloud_url dan filename asli ke dalam payload JWT
+        token = generate_token(cloud_url, filename)
+
+        return render_template(
+            "result.html",
+            token=token,
+            cloud_url=cloud_url,
+            filename=filename
+        )
+
+    except Exception as e:
+        # Jika terjadi kegagalan sistem, pastikan file temporary tetap dibersihkan
+        if os.path.exists(original_path):
+            os.remove(original_path)
+        if os.path.exists(encrypted_path):
+            os.remove(encrypted_path)
+        return f"Terjadi kesalahan saat upload/enkripsi: {str(e)}", 500
 
 # =========================
-# SECURE DOWNLOAD VIA TOKEN AKSES
+# 3. SECURE DOWNLOAD VIA TOKEN ROUTE
 # =========================
 @app.route("/secure-download")
 def secure_download():
-    # Ambil token akses dari URL
     token = request.args.get("token")
 
     if not token:
         return "Token tidak ditemukan", 400
 
-    # VALIDASI TOKEN AKSES (Memeriksa masa kedaluwarsa & keaslian token)
+    # Memverifikasi validitas dan masa kedaluwarsa JWT
     data = verify_token(token)
 
     if not data:
         return "Token tidak valid atau expired", 401
 
     filename = data["filename"]
-    cloud_url = data["cloud_url"]  # URL rahasia cloud diekstrak dari token
+    cloud_url = data["cloud_url"]  # Mengambil URL Cloudinary dari payload token
 
-    # -----------------------------------------------------------------
-    # PROSES AMBIL FILE DARI CLOUDINARY DAN DEKRIPSI (IN-MEMORY PROXY)
-    # -----------------------------------------------------------------
+    # Menentukan jalur unduhan file terenkripsi dan dekripsi sementara di lokal
+    temp_encrypted_file = os.path.join(ENCRYPTED_FOLDER, "download_" + filename + ".enc")
+    temp_decrypted_file = os.path.join(UPLOAD_FOLDER, "clean_" + filename)
+
+    # -------------------------------------------------------------
+    # FASE 1: TARIK CIPHERTEXT DARI CLOUD VIA HTTP STREAM
+    # -------------------------------------------------------------
     try:
-        # Ambil file terenkripsi dari Cloud secara streaming langsung ke RAM
         response = requests.get(cloud_url, stream=True)
-        if response.status_code != 200:
+        if response.status_code == 200:
+            with open(temp_encrypted_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        else:
             return "Gagal mengambil file terenkripsi dari Cloudinary", 404
-            
-        # Tampung byte terenkripsi ke RAM
-        encrypted_bytes = response.content 
-        
     except Exception as e:
         return f"Error koneksi Cloudinary: {str(e)}", 500
 
-    # Menyiapkan file temporer lokal hanya untuk proses dekripsi instan
-    temp_encrypted_path = os.path.join(ENCRYPTED_FOLDER, "temp_" + filename + ".enc")
-    temp_decrypted_path = os.path.join(UPLOAD_FOLDER, "temp_" + filename)
-
+    # -------------------------------------------------------------
+    # FASE 2: DEKRIPSI DAN AMANKAN DI RAM SEBELUM PENGIRIMAN
+    # -------------------------------------------------------------
     try:
-        # Tulis byte terenkripsi ke file temp untuk didekripsi oleh modul AES
-        with open(temp_encrypted_path, 'wb') as f:
-            f.write(encrypted_bytes)
+        # Mendekripsi berkas biner menggunakan fungsi asli dari encryption.py
+        decrypt_file(temp_encrypted_file, temp_decrypted_file)
 
-        # PROSES DEKRIPSI AES
-        decrypt_file(temp_encrypted_path, temp_decrypted_path)
+        # Segera hapus file biner terenkripsi (.enc) karena proses dekripsi sudah selesai
+        if os.path.exists(temp_encrypted_file):
+            os.remove(temp_encrypted_file)
 
-        # Baca file yang sudah bersih ke memori agar file fisiknya bisa langsung dihapus
-        with open(temp_decrypted_path, 'rb') as f:
-            file_data = f.read()
+        # TRIK ANTI-EROR: Membaca file asli yang bersih langsung ke memori internal (RAM)
+        # Dengan memindahkan biner ke RAM, file fisik di disk server bisa langsung kita hapus 
+        # tanpa memicu eror "File Not Found" pada fungsi send_file() milik Flask.
+        with open(temp_decrypted_file, 'rb') as f:
+            file_buffer = io.BytesIO(f.read())
 
-        # Hapus semua file sisa di server lokal (Menjaga sifat server Ephemeral tetap bersih)
-        if os.path.exists(temp_encrypted_path):
-            os.remove(temp_encrypted_path)
-        if os.path.exists(temp_decrypted_path):
-            os.remove(temp_decrypted_path)
+        # Hapus file mentah hasil dekripsi dari disk lokal server
+        if os.path.exists(temp_decrypted_file):
+            os.remove(temp_decrypted_file)
 
-        # Kirim data biner bersih dari memori langsung ke browser pengguna
+        # Kembalikan pointer buffer ke posisi awal sebelum dikirim
+        file_buffer.seek(0)
+
+        # Mengirim berkas asli yang sudah bersih sebagai lampiran unduhan
         return send_file(
-            io.BytesIO(file_data),
-            download_name=filename,
-            as_attachment=True
+            file_buffer,
+            as_attachment=True,
+            download_name=filename
         )
 
     except Exception as e:
-        # Pastikan file temp terhapus jika terjadi error di tengah jalan
-        if os.path.exists(temp_encrypted_path):
-            os.remove(temp_encrypted_path)
-        if os.path.exists(temp_decrypted_path):
-            os.remove(temp_decrypted_path)
+        # Bersihkan sisa file di server jika proses di tengah jalan mengalami crash
+        if os.path.exists(temp_encrypted_file):
+            os.remove(temp_encrypted_file)
+        if os.path.exists(temp_decrypted_file):
+            os.remove(temp_decrypted_file)
         return f"Gagal memproses dekripsi berkas: {str(e)}", 500
 
 # =========================
