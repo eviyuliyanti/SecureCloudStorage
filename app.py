@@ -13,15 +13,23 @@ import io
 app = Flask(__name__)
 
 # =================================================================
-# FOLDER SYSTEM (Menggunakan /tmp untuk kompatibilitas penuh Cloud Railway)
+# DETEKSI SISTEM OPERASI OTOMATIS (Hybrid Folder System)
 # =================================================================
-# Di server Linux/Railway, folder /tmp adalah satu-satunya tempat yang
-# diizinkan untuk membuat file temporary secara dinamis.
-UPLOAD_FOLDER = "/tmp/uploads"
-ENCRYPTED_FOLDER = "/tmp/encrypted"
+# Jika dijalankan di cloud (Railway/Linux), gunakan folder /tmp agar tidak di-crash.
+# Jika dijalankan di lokal (Windows), gunakan folder project biasa agar tidak eror.
+if os.name == 'nt':  # 'nt' artinya Windows
+    BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+    UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
+    ENCRYPTED_FOLDER = os.path.join(BASE_DIR, "encrypted")
+else:  # Linux / Environment Cloud Railway
+    UPLOAD_FOLDER = "/tmp/uploads"
+    ENCRYPTED_FOLDER = "/tmp/encrypted"
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCRYPTED_FOLDER, exist_ok=True)
+
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["ENCRYPTED_FOLDER"] = ENCRYPTED_FOLDER
 
 # =========================
 # HOME
@@ -40,24 +48,25 @@ def upload():
         return "Tidak ada file yang dipilih", 400
 
     filename = secure_filename(file.filename)
-    original_path = os.path.join(UPLOAD_FOLDER, filename)
+    original_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
     file.save(original_path)
 
     encrypted_filename = filename + ".enc"
-    encrypted_path = os.path.join(ENCRYPTED_FOLDER, encrypted_filename)
+    encrypted_path = os.path.join(app.config["ENCRYPTED_FOLDER"], encrypted_filename)
 
     try:
-        # Mengenkripsi file sebelum diunggah
+        # Mengenkripsi file menggunakan fungsi asli dari encryption.py
         encrypt_file(original_path, encrypted_path)
 
-        # Mengunggah berkas terenkripsi ke Cloudinary
+        # Mengunggah berkas biner terenkripsi ke Cloudinary
         result = cloudinary.uploader.upload(
             encrypted_path,
             resource_type="raw"
         )
         cloud_url = result["secure_url"]
 
-        # Langsung sapu bersih dari folder /tmp setelah berhasil upload
+        # HAPUS INSTAN DARI DISK SERVER LOKAL
+        # Menjaga server tetap bersih dan mematuhi batas ephemeral storage cloud
         if os.path.exists(original_path):
             os.remove(original_path)
         if os.path.exists(encrypted_path):
@@ -80,7 +89,7 @@ def upload():
         return f"Error saat upload: {str(e)}", 500
 
 # =========================
-# SECURE DOWNLOAD VIA CLOUD
+# SECURE DOWNLOAD
 # =========================
 @app.route("/secure-download")
 def secure_download():
@@ -88,7 +97,7 @@ def secure_download():
     if not token:
         return "Token tidak ditemukan", 400
 
-    # Validasi Token Akses
+    # Validasi masa aktif dan integritas kunci token akses JWT
     data = verify_token(token)
     if not data:
         return "Token tidak valid atau expired", 401
@@ -96,11 +105,11 @@ def secure_download():
     filename = data["filename"]
     cloud_url = data["cloud_url"]  
 
-    # File ditarik dan diolah di dalam isolation directory (/tmp)
-    encrypted_file = os.path.join(ENCRYPTED_FOLDER, "dl_" + filename + ".enc")
-    decrypted_file = os.path.join(UPLOAD_FOLDER, "dec_" + filename)
+    # Menentukan jalur unduhan file sementara di isolasi direktori
+    encrypted_file = os.path.join(app.config["ENCRYPTED_FOLDER"], "dl_" + filename + ".enc")
+    decrypted_file = os.path.join(app.config["UPLOAD_FOLDER"], "dec_" + filename)
 
-    # 1. UNDUH DATA TERENKRIPSI DARI CLOUDINARY
+    # 1. UNDUH DATA CIPHERTEXT DARI CLOUDINARY
     try:
         response = requests.get(cloud_url, stream=True)
         if response.status_code == 200:
@@ -112,28 +121,28 @@ def secure_download():
     except Exception as e:
         return f"Error koneksi Cloudinary: {str(e)}", 500
 
-    # 2. DEKRIPSI & AMANKAN KE MEMORI RAM
+    # 2. PROSES DEKRIPSI KEMBALI KE RAW BYTES (IN-MEMORY)
     try:
-        # Panggil fungsi dekripsi bawaan aslimu dengan aman di folder /tmp
+        # Jalankan fungsi dekripsi bawaan dari encryption.py milikmu
         decrypt_file(encrypted_file, decrypted_file)
 
-        # Hapus segera file terenkripsi agar tidak memenuhi kuota space
+        # Hapus berkas terenkripsi (.enc) di server secepat mungkin
         if os.path.exists(encrypted_file):
             os.remove(encrypted_file)
 
-        # AMANKAN KE RAM: Baca isi berkas asli yang bersih langsung ke memori internal
+        # STRATEGI IN-MEMORY BUFFER: Ekstrak file bersih langsung ke RAM internal
         with open(decrypted_file, 'rb') as f:
             file_memory_buffer = io.BytesIO(f.read())
 
-        # Hapus berkas fisik asli dari folder /tmp server
-        # Sekarang folder server 100% bersih total sebelum file dikirim ke browser!
+        # Hapus berkas mentah hasil dekripsi dari disk server fisik
+        # Menjamin keamanan data-at-rest dan kebersihan server Railway
         if os.path.exists(decrypted_file):
             os.remove(decrypted_file)
 
-        # Set pointer RAM kembali ke awal byte stream
+        # Reset pointer posisi pembacaan RAM ke letak awal
         file_memory_buffer.seek(0)
 
-        # Kirim berkas langsung dari memori internal ke browser pengguna
+        # Salurkan data bersih langsung sebagai lampiran unduhan ke browser
         return send_file(
             file_memory_buffer, 
             as_attachment=True, 
@@ -151,6 +160,4 @@ def secure_download():
 # RUN SERVER
 # =========================
 if __name__ == "__main__":
-    # Gunicorn pada Railway akan menggunakan port default, 
-    # namun baris ini tetap dipertahankan untuk kebutuhan local testing.
     app.run(debug=True)
